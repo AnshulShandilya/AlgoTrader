@@ -213,7 +213,9 @@ async def run_auto_setup(force: bool = False) -> dict:
     if len(candidates) < 5:
         log.info("Universe cache empty — running fresh screen…")
         try:
-            result = screen_universe()
+            import asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, screen_universe)
             candidates = list(result.get("filter_candidates_raw", []))
         except Exception as e:
             log.warning(f"Universe screener error: {e}")
