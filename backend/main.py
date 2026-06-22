@@ -1,3 +1,4 @@
+import os as _os
 from dotenv import load_dotenv
 load_dotenv()  # loads .env before any module reads os.getenv()
 
@@ -51,7 +52,13 @@ app = FastAPI(title="AlgoTrader API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        # Vercel preview + production URLs
+        "https://*.vercel.app",
+        # Set FRONTEND_URL env var on Railway to your custom domain if you have one
+        *([_os.environ["FRONTEND_URL"]] if "FRONTEND_URL" in _os.environ else []),
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
