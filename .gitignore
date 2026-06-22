@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Database — never commit real data
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/.turbo/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Logs
+*.log
+nohup.out
+backend/logs/
+
+# Railway / build
+*.pid
