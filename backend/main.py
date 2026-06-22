@@ -54,9 +54,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        # Vercel preview + production URLs
-        "https://*.vercel.app",
-        # Set FRONTEND_URL env var on Railway to your custom domain if you have one
+        "https://algo-trader-chi.vercel.app",
         *([_os.environ["FRONTEND_URL"]] if "FRONTEND_URL" in _os.environ else []),
     ],
     allow_credentials=True,
