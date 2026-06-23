@@ -230,6 +230,40 @@ async def run_strategy(strategy_id: int):
                     return
                 current_price = float(df["close"].iloc[-1])
 
+            # ── Fetch higher-timeframe bars for Triple Screen filter ──────────
+            # 5Min scalps need 1Hour context; 15Min day trades need 4Hour context.
+            # Prevents entering at the top of an exhausted move on the bigger canvas.
+            htf_df = None
+            _htf_map = {"1Min": "15Min", "5Min": "1Hour", "15Min": "4Hour", "1Hour": "1Day"}
+            _htf_tf = _htf_map.get(timeframe)
+            if _htf_tf and timeframe in ("1Min", "5Min", "15Min"):
+                try:
+                    import yfinance as yf
+                    import pandas as pd
+                    _yf_interval_map = {"15Min": "15m", "1Hour": "60m", "4Hour": "1h", "1Day": "1d"}
+                    _yf_period_map   = {"15Min": "5d",  "1Hour": "60d", "4Hour": "60d", "1Day": "1y"}
+                    _yf_iv  = _yf_interval_map.get(_htf_tf, "60m")
+                    _yf_per = _yf_period_map.get(_htf_tf, "60d")
+                    # Alpaca broker path for US stocks; yfinance for everything else
+                    if is_uk_stock or is_eu_stock or is_commodity or is_forex:
+                        _yf_sym = sym.upper().replace("/", "-")
+                        _raw_htf = yf.Ticker(_yf_sym).history(period=_yf_per, interval=_yf_iv, auto_adjust=True)
+                        if _raw_htf is not None and not _raw_htf.empty:
+                            _raw_htf = _raw_htf.reset_index()
+                            _raw_htf.columns = [str(c).lower() for c in _raw_htf.columns]
+                            for _a in ("date", "index", "datetime"):
+                                if _a in _raw_htf.columns:
+                                    _raw_htf = _raw_htf.rename(columns={_a: "datetime"})
+                                    break
+                            htf_df = _raw_htf[["datetime", "open", "high", "low", "close", "volume"]].tail(100).reset_index(drop=True)
+                    else:
+                        # Map our internal TF name to Alpaca-compatible timeframe
+                        _alpaca_htf = {"15Min": "15Min", "1Hour": "1Hour", "4Hour": "4Hour"}.get(_htf_tf)
+                        if _alpaca_htf:
+                            htf_df = broker.get_bars(sym, timeframe=_alpaca_htf, limit=100)
+                except Exception as _e:
+                    log.debug(f"[{strategy.name}] HTF bars fetch skipped: {_e}")
+
             # ── Step 1: Check open trades for SL / TP ────────────────────────
             open_result = await db.execute(
                 select(Trade).where(Trade.status == TradeStatus.open,
@@ -324,7 +358,14 @@ async def run_strategy(strategy_id: int):
             # ── Step 2: Generate fresh signal ────────────────────────────────
             strat_obj = _get_strat(strategy.template, strategy.parameters,
                                    strategy.risk_config, sym)
-            signal = strat_obj.generate_signal(df)
+            # Pass HTF bars to scalping strategy for Triple Screen filter
+            if hasattr(strat_obj, "generate_signal") and htf_df is not None:
+                try:
+                    signal = strat_obj.generate_signal(df, htf_df=htf_df)
+                except TypeError:
+                    signal = strat_obj.generate_signal(df)  # non-scalping strategies
+            else:
+                signal = strat_obj.generate_signal(df)
 
             log.info(f"[{strategy.name}] {sym} → {signal.action.upper()} "
                      f"(conf: {signal.confidence:.2f}) price: ${current_price}")

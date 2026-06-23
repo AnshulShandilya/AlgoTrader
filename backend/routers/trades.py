@@ -211,17 +211,51 @@ async def execute_strategy(strategy_id: int, db: AsyncSession = Depends(get_db))
     from routers.strategies import _pick_broker, _fetch_bars
 
     sym = strategy_row.symbol
-    is_uk_stock  = sym.upper().endswith(".L")
-    is_commodity = sym.upper().endswith("=F")
+    _sym_up = sym.upper()
+    is_uk_stock  = _sym_up.endswith(".L")
+    is_commodity = _sym_up.endswith("=F")
+    is_forex     = _sym_up.endswith("=X")
+    is_crypto    = _sym_up.endswith("-USD") or "/" in _sym_up
+    is_paper_only = is_uk_stock or is_commodity or is_forex or is_crypto
 
     def _run(settings, strategy_row):
+        import yfinance as yf
         timeframe = strategy_row.parameters.get("timeframe", "1Day")
         broker = _pick_broker(settings, sym)
         df    = _fetch_bars(broker, sym, timeframe, settings)
         strat = get_strategy(strategy_row.template, strategy_row.parameters,
                              strategy_row.risk_config, sym)
-        signal = strat.generate_signal(df)
-        account = broker.get_account() if not (is_uk_stock or is_commodity) else {"equity": 100_000}
+
+        # Fetch higher-timeframe bars for Triple Screen filter
+        _htf_map = {"1Min": "15Min", "5Min": "1Hour", "15Min": "4Hour", "1Hour": "1Day"}
+        _htf_tf  = _htf_map.get(timeframe)
+        htf_df   = None
+        if _htf_tf and timeframe in ("1Min", "5Min", "15Min"):
+            try:
+                _yf_iv_map  = {"15Min": "15m", "1Hour": "60m", "4Hour": "1h", "1Day": "1d"}
+                _yf_per_map = {"15Min": "5d",  "1Hour": "60d", "4Hour": "60d", "1Day": "1y"}
+                _yf_iv  = _yf_iv_map.get(_htf_tf, "60m")
+                _yf_per = _yf_per_map.get(_htf_tf, "60d")
+                _yf_sym = sym.upper().replace("/", "-")
+                _raw = yf.Ticker(_yf_sym).history(period=_yf_per, interval=_yf_iv, auto_adjust=True)
+                if _raw is not None and not _raw.empty:
+                    _raw = _raw.reset_index()
+                    _raw.columns = [str(c).lower() for c in _raw.columns]
+                    for _a in ("date", "index", "datetime"):
+                        if _a in _raw.columns:
+                            _raw = _raw.rename(columns={_a: "datetime"})
+                            break
+                    htf_df = _raw[["datetime", "open", "high", "low", "close", "volume"]].tail(100).reset_index(drop=True)
+            except Exception:
+                pass  # HTF fetch failure is non-fatal; strategy runs without filter
+
+        # Pass HTF bars to scalping strategy for Triple Screen filter
+        try:
+            signal = strat.generate_signal(df, htf_df=htf_df)
+        except TypeError:
+            signal = strat.generate_signal(df)
+
+        account = broker.get_account() if not is_paper_only else {"equity": 100_000}
         return signal, broker, account
 
     try:
@@ -244,8 +278,8 @@ async def execute_strategy(strategy_id: int, db: AsyncSession = Depends(get_db))
         if daily_count >= max_daily:
             raise HTTPException(429, f"Daily trade limit ({max_daily}) reached — {daily_count} trades placed today. Resets at midnight UTC.")
 
-    if is_uk_stock or is_commodity:
-        # Paper-trade: record in DB with current price (no live broker needed)
+    if is_paper_only:
+        # Paper-trade: record in DB with current price (no live broker for UK/commodity/crypto/forex)
         _price = signal.indicators.get("close", 0)
         if not _price or _price <= 0:
             return {"action": signal.action, "message": "No valid price — skipping.", "indicators": signal.indicators}
@@ -268,6 +302,9 @@ async def execute_strategy(strategy_id: int, db: AsyncSession = Depends(get_db))
         # Enforce a floor of 0.75% so the stop sits outside normal noise.
         if is_uk_stock and _sl_pct < 0.75:
             _sl_pct = 0.75
+        # Crypto: minimum 0.5% SL to survive exchange spread + funding noise
+        if is_crypto and _sl_pct < 0.5:
+            _sl_pct = 0.5
 
         _sl = round(_price * (1 - _sl_pct / 100 if signal.action == "buy" else 1 + _sl_pct / 100), 6)
         _tp = round(_price * (1 + _tp_pct / 100 if signal.action == "buy" else 1 - _tp_pct / 100), 6)
@@ -285,7 +322,7 @@ async def execute_strategy(strategy_id: int, db: AsyncSession = Depends(get_db))
             stop_loss_price=_sl,
             take_profit_price=_tp,
             status=TradeStatus.open,
-            notes=f"Paper trade · {'UK stock' if is_uk_stock else 'commodity'} · conf {signal.confidence:.2f}",
+            notes=f"Paper trade · {'UK stock' if is_uk_stock else 'commodity' if is_commodity else 'crypto' if is_crypto else 'forex'} · conf {signal.confidence:.2f}",
             opened_at=datetime.utcnow(),
         )
         db.add(trade)
