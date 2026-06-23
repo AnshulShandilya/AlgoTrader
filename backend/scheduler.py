@@ -206,18 +206,32 @@ async def run_strategy(strategy_id: int):
                     return
 
             # ── Fetch current price + bars ────────────────────────────────────
+            # Map strategy timeframe → yfinance interval + lookback period
+            # so UK/EU/commodity/forex bars match the actual strategy cadence.
+            _YF_INTERVAL = {
+                "1Min":  ("2m",  "5d"),
+                "5Min":  ("5m",  "60d"),
+                "15Min": ("15m", "60d"),
+                "1Hour": ("60m", "60d"),
+                "4Hour": ("1h",  "730d"),
+                "1Day":  ("1d",  "2y"),
+            }
             if is_uk_stock or is_eu_stock or is_commodity or is_forex:
-                # yfinance-only symbols — fetch bars to get current price
                 import yfinance as yf
                 import pandas as pd
                 yf_sym = sym.upper().replace("/", "-")
-                raw = yf.Ticker(yf_sym).history(period="6mo", interval="1d", auto_adjust=True)
+                _yf_iv, _yf_per = _YF_INTERVAL.get(timeframe, ("5m", "60d"))
+                raw = yf.Ticker(yf_sym).history(period=_yf_per, interval=_yf_iv, auto_adjust=True)
+                # Intraday yfinance only goes back 60 days max; fall back to daily if empty
                 if raw is None or raw.empty:
-                    log.warning(f"[{strategy.name}] No yfinance data for {sym}")
+                    log.warning(f"[{strategy.name}] No {_yf_iv} data for {sym} — trying daily")
+                    raw = yf.Ticker(yf_sym).history(period="2y", interval="1d", auto_adjust=True)
+                if raw is None or raw.empty:
+                    log.warning(f"[{strategy.name}] No yfinance data for {sym} — skipping")
                     return
                 raw = raw.reset_index()
                 raw.columns = [str(c).lower() for c in raw.columns]
-                for alias in ("date", "index", "datetime"):
+                for alias in ("date", "index", "datetime", "timestamp"):
                     if alias in raw.columns:
                         raw = raw.rename(columns={alias: "datetime"})
                         break

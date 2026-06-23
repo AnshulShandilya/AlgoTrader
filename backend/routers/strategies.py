@@ -31,17 +31,35 @@ def _pick_broker(settings, symbol: str):
 
 
 def _fetch_bars(broker, symbol: str, timeframe: str, settings):
-    """Fetch bars, using yfinance for UK stocks and commodities."""
+    """Fetch bars via yfinance for non-Alpaca symbols, broker for US equities."""
     sym = symbol.upper()
-    if sym.endswith(".L") or sym.endswith("=F"):
+    use_yfinance = (
+        sym.endswith(".L")      # UK LSE stocks (pence-quoted)
+        or sym.endswith("=F")   # Commodities (gold GC=F, oil CL=F)
+        or sym.endswith("=X")   # Forex pairs (EURUSD=X, GBPUSD=X)
+        or sym.endswith("-USD")  # Crypto (BTC-USD, ETH-USD, SOL-USD)
+    )
+    if use_yfinance:
         import yfinance as yf
         yf_sym = sym.replace("/", "-")
-        raw = yf.Ticker(yf_sym).history(period="2y", interval="1d", auto_adjust=True)
+        _YF_INTERVAL = {
+            "1Min":  ("2m",  "5d"),
+            "5Min":  ("5m",  "60d"),
+            "15Min": ("15m", "60d"),
+            "1Hour": ("60m", "60d"),
+            "4Hour": ("1h",  "730d"),
+            "1Day":  ("1d",  "2y"),
+        }
+        _yf_iv, _yf_per = _YF_INTERVAL.get(timeframe, ("5m", "60d"))
+        raw = yf.Ticker(yf_sym).history(period=_yf_per, interval=_yf_iv, auto_adjust=True)
+        if raw is None or raw.empty:
+            # Intraday may not be available for some symbols — fall back to daily
+            raw = yf.Ticker(yf_sym).history(period="2y", interval="1d", auto_adjust=True)
         if raw is None or raw.empty:
             raise ValueError(f"No market data available for {symbol}")
         raw = raw.reset_index()
         raw.columns = [str(c).lower() for c in raw.columns]
-        for alias in ("date", "index", "datetime"):
+        for alias in ("date", "index", "datetime", "timestamp"):
             if alias in raw.columns:
                 raw = raw.rename(columns={alias: "datetime"})
                 break
