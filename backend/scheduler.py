@@ -979,6 +979,188 @@ async def eod_flatten(market: str = "us"):
         log.info(f"[eod_flatten] {market.upper()}: {flattened} intraday position(s) closed")
 
 
+_MAX_HOLD_MINUTES = {
+    "scalping":        30,    # 6 × 5Min bars
+    "scalping_forex":  30,
+    "day_trading":     240,   # 4 hours
+    "intraday_swing":  480,   # 8 hours
+    "swing_trading":   7200,  # 5 days (weekdays only)
+}
+
+async def check_trade_expiry():
+    """
+    Runs every 5 minutes. Closes any open trade that has exceeded its
+    max hold time. Applies to all trade types including paper UK trades.
+    """
+    async with SessionLocal() as db:
+        open_trades = (await db.execute(
+            select(Trade).where(Trade.status == TradeStatus.open)
+        )).scalars().all()
+
+        if not open_trades:
+            return
+
+        now = datetime.utcnow()
+        expired = []
+        for trade in open_trades:
+            if not trade.opened_at:
+                continue
+            # Determine trade type from strategy parameters
+            strat = None
+            if trade.strategy_id:
+                strat_res = await db.execute(
+                    select(Strategy).where(Strategy.id == trade.strategy_id)
+                )
+                strat = strat_res.scalar_one_or_none()
+
+            trade_type = (strat.parameters.get("trade_type", "scalping") if strat else "scalping")
+            max_mins = _MAX_HOLD_MINUTES.get(trade_type, 30)
+            held_mins = (now - trade.opened_at).total_seconds() / 60
+
+            if held_mins >= max_mins:
+                expired.append((trade, strat, held_mins, max_mins))
+
+        if not expired:
+            return
+
+        settings_res = await db.execute(select(BotSettings).where(BotSettings.id == 1))
+        settings = settings_res.scalar_one_or_none()
+
+        for trade, strat, held_mins, max_mins in expired:
+            sym = trade.symbol
+            # Get current price
+            current_price = None
+            try:
+                import yfinance as yf
+                tk = yf.Ticker(sym)
+                hist = tk.history(period="1d", interval="5m")
+                if hist is not None and not hist.empty:
+                    current_price = float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
+
+            if not current_price:
+                current_price = trade.entry_price  # fallback: close at entry (scratch)
+
+            pnl = round((current_price - trade.entry_price) * trade.qty *
+                        (1 if trade.side == TradeSide.buy else -1), 4)
+
+            trade.exit_price   = current_price
+            trade.exit_reason  = "time_stop"
+            trade.status       = TradeStatus.closed
+            trade.closed_at    = now
+            trade.pnl          = pnl
+            trade.pnl_pct      = round((pnl / (trade.entry_price * trade.qty)) * 100, 4) if trade.entry_price else 0
+
+            if strat:
+                strat.total_trades   = (strat.total_trades or 0) + 1
+                if pnl > 0:
+                    strat.winning_trades = (strat.winning_trades or 0) + 1
+                strat.total_pnl      = round((strat.total_pnl or 0) + pnl, 4)
+
+            log.info(f"[expiry] Trade #{trade.id} {sym} expired after {held_mins:.0f}min "
+                     f"(max {max_mins}min) — closed @ {current_price:.4f} PnL={pnl:+.4f}")
+
+            _write_event_sync(
+                type="trade_close", severity="warning",
+                title=f"⏱ Time-stop: {sym} closed after {held_mins:.0f}min",
+                body=f"Max hold {max_mins}min reached · exit {current_price:.4f} · PnL {pnl:+.4f}",
+                symbol=sym,
+                meta={"trade_id": trade.id, "held_mins": round(held_mins), "pnl": pnl},
+            )
+
+        await db.commit()
+        log.info(f"[expiry] Closed {len(expired)} expired trade(s)")
+
+
+# ── 24/7 multi-market strategy watchlist ─────────────────────────────────────
+# These strategies are always deployed on startup and re-checked every 4h.
+# Covers all time zones: crypto (24/5), UK (08-16:35 BST), US (09:30-16 ET),
+# EU (09-17:30 CET), commodities, and forex.
+_247_WATCHLIST = [
+    # Crypto — 24/5, always active
+    {"symbol": "BTC-USD", "template": "scalping", "trade_type": "scalping",
+     "sl": 0.5, "tp": 1.25, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "ETH-USD", "template": "scalping", "trade_type": "scalping",
+     "sl": 0.5, "tp": 1.25, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "SOL-USD", "template": "scalping", "trade_type": "scalping",
+     "sl": 0.5, "tp": 1.25, "pos": 3.0, "tf": "5Min"},
+    # UK FTSE — 08:00–16:35 BST
+    {"symbol": "LLOY.L",  "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "BARC.L",  "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "IAG.L",   "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "BP.L",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "VOD.L",   "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "HSBA.L",  "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    # US large caps — 09:30–16:00 ET
+    {"symbol": "AAPL",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    {"symbol": "NVDA",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.4, "tp": 1.0,  "pos": 3.0, "tf": "5Min"},
+    {"symbol": "TSLA",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.4, "tp": 1.0,  "pos": 3.0, "tf": "5Min"},
+    {"symbol": "ABBV",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+    # Commodities — 09:00–17:30 ET
+    {"symbol": "GC=F",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 2.0, "tf": "5Min"},
+    {"symbol": "CL=F",    "template": "scalping", "trade_type": "scalping",
+     "sl": 0.3, "tp": 0.75, "pos": 2.0, "tf": "5Min"},
+    # Forex — 07:00–17:00 UTC
+    {"symbol": "EURUSD=X", "template": "scalping", "trade_type": "scalping_forex",
+     "sl": 0.1, "tp": 0.25, "pos": 5.0, "tf": "5Min"},
+    {"symbol": "GBPUSD=X", "template": "scalping", "trade_type": "scalping_forex",
+     "sl": 0.1, "tp": 0.25, "pos": 5.0, "tf": "5Min"},
+]
+
+async def ensure_24_7_strategies():
+    """
+    Ensures all 24/7 watchlist strategies exist in the DB.
+    Runs at startup and every 4h. Skips symbols already present.
+    """
+    async with SessionLocal() as db:
+        existing_res = await db.execute(select(Strategy))
+        existing_symbols = {s.symbol.upper() for s in existing_res.scalars().all()}
+
+        added = 0
+        for w in _247_WATCHLIST:
+            if w["symbol"].upper() in existing_symbols:
+                continue
+            strat = Strategy(
+                name=f"[AUTO] {w['symbol']} [{'SCALP-FX' if w['trade_type']=='scalping_forex' else 'SCALP'}]",
+                template=w["template"],
+                symbol=w["symbol"],
+                parameters={
+                    "fast_ema": 9, "slow_ema": 21, "rsi_period": 14,
+                    "rsi_buy_level": 45, "rsi_sell_level": 55,
+                    "vol_multiplier": 1.3, "timeframe": w["tf"],
+                    "trade_type": w["trade_type"],
+                },
+                risk_config={
+                    "stop_loss_pct": w["sl"],
+                    "take_profit_pct": w["tp"],
+                    "position_size_pct": w["pos"],
+                },
+                status=StrategyStatus.active,
+            )
+            db.add(strat)
+            existing_symbols.add(w["symbol"].upper())
+            added += 1
+
+        if added:
+            await db.commit()
+            log.info(f"[24/7 bootstrap] Added {added} missing strategies from watchlist")
+
+        # Register scheduler jobs for any strategies not yet scheduled
+        await reload_jobs()
+
+
 async def start_scheduler():
     if not scheduler.running:
         scheduler.start()
@@ -1157,3 +1339,33 @@ async def start_scheduler():
         max_instances=1,
     )
     log.info("Grok NYSE pre-open scan registered (13:15 UTC / 14:15 BST)")
+
+    # ── Trade expiry monitor (every 5 minutes) ───────────────────────────────
+    # Closes stale open trades that have exceeded their max hold time.
+    # Prevents old losing setups from blocking new opportunities.
+    scheduler.add_job(
+        check_trade_expiry,
+        trigger=IntervalTrigger(minutes=5),
+        id="trade_expiry_monitor",
+        name="Trade expiry monitor (5min)",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    log.info("Trade expiry monitor registered (every 5 min)")
+
+    # ── 24/7 strategy bootstrap (every 4 hours) ──────────────────────────────
+    # Ensures multi-market strategies are always active across all time zones.
+    # Runs on startup + every 4h to cover market rotations.
+    scheduler.add_job(
+        ensure_24_7_strategies,
+        trigger=IntervalTrigger(hours=4),
+        id="bootstrap_247_strategies",
+        name="24/7 strategy bootstrap (4h)",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    # Run once immediately at startup
+    _asyncio.ensure_future(ensure_24_7_strategies())
+    log.info("24/7 strategy bootstrap registered (every 4h)")
