@@ -249,8 +249,26 @@ async def execute_strategy(strategy_id: int, db: AsyncSession = Depends(get_db))
         _price = signal.indicators.get("close", 0)
         if not _price or _price <= 0:
             return {"action": signal.action, "message": "No valid price — skipping.", "indicators": signal.indicators}
+
+        # Duplicate guard: don't open a second trade if one is already open
+        _dup = await db.execute(
+            select(Trade).where(
+                Trade.status == TradeStatus.open,
+                Trade.strategy_id == strategy_row.id,
+                Trade.symbol == sym,
+            )
+        )
+        if _dup.scalar_one_or_none():
+            return {"action": "hold", "message": f"Already have an open trade for {sym} — skipping duplicate.", "indicators": signal.indicators}
+
         _sl_pct = strategy_row.risk_config.get("stop_loss_pct", 0.3)
         _tp_pct = strategy_row.risk_config.get("take_profit_pct", 0.75)
+
+        # UK stocks trade in pence — 0.3% SL is inside the bid-ask spread.
+        # Enforce a floor of 0.75% so the stop sits outside normal noise.
+        if is_uk_stock and _sl_pct < 0.75:
+            _sl_pct = 0.75
+
         _sl = round(_price * (1 - _sl_pct / 100 if signal.action == "buy" else 1 + _sl_pct / 100), 6)
         _tp = round(_price * (1 + _tp_pct / 100 if signal.action == "buy" else 1 - _tp_pct / 100), 6)
         _equity = 100_000.0

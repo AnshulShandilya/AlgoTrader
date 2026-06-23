@@ -449,9 +449,23 @@ async def run_strategy(strategy_id: int):
                     )
                     return
 
-                # Don't double-enter if already long
+                # Don't double-enter if already long (in-memory check above + DB guard)
                 if any(t.side == TradeSide.buy for t in open_trades):
                     log.info(f"[{strategy.name}] Already long {sym} — skip")
+                    return
+
+                # Hard DB guard: reject if an open trade for this strategy+symbol already exists.
+                # Catches races where two concurrent async ticks both pass the in-memory cooldown.
+                dup_res = await db.execute(
+                    select(Trade).where(
+                        Trade.status == TradeStatus.open,
+                        Trade.strategy_id == strategy.id,
+                        Trade.symbol == sym,
+                    )
+                )
+                if dup_res.scalar_one_or_none():
+                    log.info(f"[{strategy.name}] DB guard — open trade already exists for {sym}, skipping")
+                    _last_signal[symbol_key] = (signal.action, datetime.utcnow())
                     return
 
                 sl_pct = strategy.risk_config.get("stop_loss_pct", 1.5)
@@ -461,6 +475,30 @@ async def run_strategy(strategy_id: int):
                 if not sl_pct or sl_pct <= 0:
                     sl_pct = 1.5
                     log.warning(f"[{strategy.name}] No SL configured — defaulting to 1.5%")
+
+                # UK stocks trade in pence on LSE — bid-ask spread is typically 0.3–0.5p.
+                # A 0.3% SL on a 110p stock = 0.33p, which is inside the spread and gets
+                # stopped out by noise before any real move. Enforce a wider floor.
+                if is_uk_stock and sl_pct < 0.75:
+                    sl_pct = 0.75
+                    log.info(f"[{strategy.name}] UK stock SL floor applied: 0.75% (was {strategy.risk_config.get('stop_loss_pct', '?')}%)")
+
+                # ATR-based stop for UK stocks: 1.5× ATR floor so the stop sits
+                # outside natural spread noise (0.3% flat was inside the bid-ask).
+                if is_uk_stock and df is not None and len(df) >= 14:
+                    high = df["high"].astype(float)
+                    low  = df["low"].astype(float)
+                    close_prev = df["close"].astype(float).shift(1)
+                    tr = pd.concat([
+                        high - low,
+                        (high - close_prev).abs(),
+                        (low  - close_prev).abs(),
+                    ], axis=1).max(axis=1)
+                    atr14 = tr.rolling(14).mean().iloc[-1]
+                    atr_stop_pct = (atr14 * 1.5 / current_price) * 100
+                    if atr_stop_pct > sl_pct:
+                        log.info(f"[{strategy.name}] ATR stop {atr_stop_pct:.3f}% > config {sl_pct:.3f}% — using ATR for {sym}")
+                        sl_pct = round(atr_stop_pct, 4)
 
                 sl_price_val = round(current_price * (1 - sl_pct / 100), 6)
                 tp_price_val = round(current_price * (1 + tp_pct / 100), 6)
@@ -982,6 +1020,7 @@ async def eod_flatten(market: str = "us"):
 _MAX_HOLD_MINUTES = {
     "scalping":        30,    # 6 × 5Min bars
     "scalping_forex":  30,
+    "scalping_uk":     45,    # wider: LSE spreads slow price discovery vs US
     "day_trading":     240,   # 4 hours
     "intraday_swing":  480,   # 8 hours
     "swing_trading":   7200,  # 5 days (weekdays only)
@@ -1014,6 +1053,9 @@ async def check_trade_expiry():
                 strat = strat_res.scalar_one_or_none()
 
             trade_type = (strat.parameters.get("trade_type", "scalping") if strat else "scalping")
+            # UK stocks get 45-min window; override generic scalping key
+            if trade_type == "scalping" and trade.symbol.upper().endswith(".L"):
+                trade_type = "scalping_uk"
             max_mins = _MAX_HOLD_MINUTES.get(trade_type, 30)
             held_mins = (now - trade.opened_at).total_seconds() / 60
 
@@ -1086,18 +1128,19 @@ _247_WATCHLIST = [
     {"symbol": "SOL-USD", "template": "scalping", "trade_type": "scalping",
      "sl": 0.5, "tp": 1.25, "pos": 3.0, "tf": "5Min"},
     # UK FTSE — 08:00–16:35 BST
+    # SL=0.75%: LSE bid-ask spread on penny stocks is ~0.3-0.5p; 0.3% SL was inside the spread.
     {"symbol": "LLOY.L",  "template": "scalping", "trade_type": "scalping",
-     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+     "sl": 0.75, "tp": 1.75, "pos": 3.0, "tf": "5Min"},
     {"symbol": "BARC.L",  "template": "scalping", "trade_type": "scalping",
-     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+     "sl": 0.75, "tp": 1.75, "pos": 3.0, "tf": "5Min"},
     {"symbol": "IAG.L",   "template": "scalping", "trade_type": "scalping",
-     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+     "sl": 0.75, "tp": 1.75, "pos": 3.0, "tf": "5Min"},
     {"symbol": "BP.L",    "template": "scalping", "trade_type": "scalping",
-     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+     "sl": 0.75, "tp": 1.75, "pos": 3.0, "tf": "5Min"},
     {"symbol": "VOD.L",   "template": "scalping", "trade_type": "scalping",
-     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+     "sl": 0.75, "tp": 1.75, "pos": 3.0, "tf": "5Min"},
     {"symbol": "HSBA.L",  "template": "scalping", "trade_type": "scalping",
-     "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
+     "sl": 0.75, "tp": 1.75, "pos": 3.0, "tf": "5Min"},
     # US large caps — 09:30–16:00 ET
     {"symbol": "AAPL",    "template": "scalping", "trade_type": "scalping",
      "sl": 0.3, "tp": 0.75, "pos": 3.0, "tf": "5Min"},
