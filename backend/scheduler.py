@@ -162,81 +162,47 @@ async def run_strategy(strategy_id: int):
             timeframe = strategy.parameters.get("timeframe", "1Day")
 
             # ── Sub-session window gate ───────────────────────────────────────
-            # Scalping (5Min/1Min): fire only during peak-liquidity windows per market.
+            # Scalping (5Min/1Min): run full session per market.
+            #   vol_ratio ≥ 1.3 in the strategy itself filters out low-quality
+            #   midday setups — no need for a narrow sub-session gate on top.
             # Day trading (15Min): avoid midday chop per market.
             # 1Hour / 1Day: full session, no extra gate.
             if timeframe in ("1Min", "5Min"):
                 if is_forex:
-                    # Forex: London open (07:00-09:00 UTC) + London-NY overlap (13:00-17:00 UTC)
-                    in_window = (
-                        _in_session("UTC", 7, 0, 9, 0) or
-                        _in_session("UTC", 13, 0, 17, 0)
-                    )
+                    # Forex: full London + NY session
+                    in_window = _in_session("UTC", 7, 0, 17, 0)
                 elif is_crypto:
-                    # Crypto: Asian open + London open + NY open (high-liquidity overlaps)
-                    in_window = (
-                        _in_session("UTC", 0, 0, 2, 0) or   # Asian session open
-                        _in_session("UTC", 7, 0, 9, 0) or   # London open
-                        _in_session("UTC", 13, 0, 17, 0)     # NY open
-                    )
+                    # Crypto: 24/5 — already weekend-gated above
+                    in_window = True
                 elif is_eu_stock:
-                    # EU stocks: open rush (09:00-11:00 CET) + US overlap / close rush (15:30-17:30 CET)
-                    in_window = (
-                        _in_session("Europe/Paris", 9, 0, 11, 0) or
-                        _in_session("Europe/Paris", 15, 30, 17, 30)
-                    )
+                    # EU stocks: full Euronext/XETRA session
+                    in_window = _in_session("Europe/Paris", 9, 0, 17, 30)
                 elif is_uk_stock:
-                    # UK stocks: open rush (08:00-10:00 BST) + US overlap / close rush (14:30-16:35 BST)
-                    in_window = (
-                        _in_session("Europe/London", 8, 0, 10, 0) or
-                        _in_session("Europe/London", 14, 30, 16, 35)
-                    )
+                    # UK stocks: full LSE session
+                    in_window = _in_session("Europe/London", 8, 0, 16, 35)
                 elif is_commodity:
-                    # Commodities: CME open rush (09:00-11:00 ET) + afternoon (13:30-16:00 ET)
-                    in_window = (
-                        _in_session("America/New_York", 9, 0, 11, 0) or
-                        _in_session("America/New_York", 13, 30, 16, 0)
-                    )
+                    # Commodities: full CME session
+                    in_window = _in_session("America/New_York", 9, 0, 17, 30)
                 else:
-                    # US stocks (NYSE/NASDAQ): open rush + close rush, skip midday
-                    in_window = (
-                        _in_session("America/New_York", 9, 30, 11, 0) or
-                        _in_session("America/New_York", 14, 30, 16, 0)
-                    )
+                    # US stocks: full NYSE/NASDAQ session
+                    in_window = _in_session("America/New_York", 9, 30, 16, 0)
                 if not in_window:
                     log.debug(f"[{strategy.name}] Outside scalping window — skipping tick")
                     return
 
             elif timeframe == "15Min":
                 if is_forex:
-                    # Forex day trading: London open + NY open, skip NY lunch
-                    in_window = (
-                        _in_session("UTC", 7, 0, 12, 0) or
-                        _in_session("UTC", 13, 0, 17, 0)
-                    )
+                    in_window = _in_session("UTC", 7, 0, 17, 0)
                 elif is_eu_stock:
-                    in_window = (
-                        _in_session("Europe/Paris", 9, 0, 12, 0) or
-                        _in_session("Europe/Paris", 14, 0, 17, 30)
-                    )
+                    in_window = _in_session("Europe/Paris", 9, 0, 17, 30)
                 elif is_uk_stock:
-                    in_window = (
-                        _in_session("Europe/London", 8, 0, 11, 30) or
-                        _in_session("Europe/London", 13, 30, 16, 35)
-                    )
+                    in_window = _in_session("Europe/London", 8, 0, 16, 35)
                 elif is_commodity:
-                    in_window = (
-                        _in_session("America/New_York", 9, 0, 11, 30) or
-                        _in_session("America/New_York", 13, 30, 16, 0)
-                    )
+                    in_window = _in_session("America/New_York", 9, 0, 17, 30)
                 else:
-                    # US stocks
-                    in_window = (
-                        _in_session("America/New_York", 9, 30, 11, 30) or
-                        _in_session("America/New_York", 13, 30, 16, 0)
-                    )
+                    in_window = _in_session("America/New_York", 9, 30, 16, 0)
                 if not in_window:
-                    log.debug(f"[{strategy.name}] Midday chop window — skipping day-trading tick")
+                    log.debug(f"[{strategy.name}] Outside day-trading window — skipping tick")
                     return
 
             # ── Fetch current price + bars ────────────────────────────────────
