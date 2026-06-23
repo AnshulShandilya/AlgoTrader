@@ -221,6 +221,34 @@ async def run_auto_setup(force: bool = False) -> dict:
             log.warning(f"Universe screener error: {e}")
             candidates = []
 
+    # ── Hard fallback: build synthetic candidates from multi-market watchlist ──
+    # Used when yfinance is rate-limited (common on cloud IPs).
+    # Spread across UK, US, crypto so auto-setup always covers live markets.
+    if len(candidates) < 5:
+        log.warning("Screener returned < 5 candidates — using static multi-market fallback")
+        _STATIC_WATCHLIST = [
+            # UK FTSE (always open during EU hours)
+            {"symbol": "LLOY.L",  "asset_class": "uk_stock",  "pct_change": 1.2, "vol_ratio": 1.5, "rsi": 55, "direction": "up"},
+            {"symbol": "BARC.L",  "asset_class": "uk_stock",  "pct_change": 1.0, "vol_ratio": 1.4, "rsi": 52, "direction": "up"},
+            {"symbol": "IAG.L",   "asset_class": "uk_stock",  "pct_change": 1.5, "vol_ratio": 1.6, "rsi": 58, "direction": "up"},
+            {"symbol": "BP.L",    "asset_class": "uk_stock",  "pct_change": 0.8, "vol_ratio": 1.3, "rsi": 50, "direction": "up"},
+            {"symbol": "VOD.L",   "asset_class": "uk_stock",  "pct_change": 0.9, "vol_ratio": 1.3, "rsi": 48, "direction": "up"},
+            {"symbol": "HSBA.L",  "asset_class": "uk_stock",  "pct_change": 0.7, "vol_ratio": 1.4, "rsi": 51, "direction": "up"},
+            # US large caps
+            {"symbol": "AAPL",    "asset_class": "us_stock",  "pct_change": 1.0, "vol_ratio": 1.5, "rsi": 55, "direction": "up"},
+            {"symbol": "NVDA",    "asset_class": "us_stock",  "pct_change": 2.0, "vol_ratio": 2.0, "rsi": 60, "direction": "up"},
+            {"symbol": "TSLA",    "asset_class": "us_stock",  "pct_change": 1.8, "vol_ratio": 1.8, "rsi": 58, "direction": "up"},
+            {"symbol": "ABBV",    "asset_class": "us_stock",  "pct_change": 0.8, "vol_ratio": 1.3, "rsi": 50, "direction": "up"},
+            # Crypto (24/5)
+            {"symbol": "BTC-USD", "asset_class": "crypto",    "pct_change": 1.5, "vol_ratio": 1.6, "rsi": 55, "direction": "up"},
+            {"symbol": "ETH-USD", "asset_class": "crypto",    "pct_change": 1.2, "vol_ratio": 1.5, "rsi": 52, "direction": "up"},
+            {"symbol": "SOL-USD", "asset_class": "crypto",    "pct_change": 2.0, "vol_ratio": 1.7, "rsi": 58, "direction": "up"},
+            # Commodities
+            {"symbol": "GC=F",   "asset_class": "commodity",  "pct_change": 0.5, "vol_ratio": 1.3, "rsi": 50, "direction": "up"},
+            {"symbol": "CL=F",   "asset_class": "commodity",  "pct_change": 0.8, "vol_ratio": 1.4, "rsi": 52, "direction": "up"},
+        ]
+        candidates = _STATIC_WATCHLIST
+
     # ── Step 2: Score and rank ──────────────────────────────────────────────────
     if candidates:
         for c in candidates:

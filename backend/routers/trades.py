@@ -245,10 +245,49 @@ async def execute_strategy(strategy_id: int, db: AsyncSession = Depends(get_db))
             raise HTTPException(429, f"Daily trade limit ({max_daily}) reached — {daily_count} trades placed today. Resets at midnight UTC.")
 
     if is_uk_stock or is_commodity:
+        # Paper-trade: record in DB with current price (no live broker needed)
+        _price = signal.indicators.get("close", 0)
+        if not _price or _price <= 0:
+            return {"action": signal.action, "message": "No valid price — skipping.", "indicators": signal.indicators}
+        _sl_pct = strategy_row.risk_config.get("stop_loss_pct", 0.3)
+        _tp_pct = strategy_row.risk_config.get("take_profit_pct", 0.75)
+        _sl = round(_price * (1 - _sl_pct / 100 if signal.action == "buy" else 1 + _sl_pct / 100), 6)
+        _tp = round(_price * (1 + _tp_pct / 100 if signal.action == "buy" else 1 - _tp_pct / 100), 6)
+        _equity = 100_000.0
+        _risk_cap = _equity * 0.01
+        _stop_dist = abs(_price - _sl)
+        _qty = max(1.0, round(_risk_cap / _stop_dist)) if _stop_dist > 0 else 1.0
+        from routers.events import write_event
+        trade = Trade(
+            strategy_id=strategy_row.id,
+            symbol=sym,
+            side=signal.action,
+            qty=_qty,
+            entry_price=_price,
+            stop_loss_price=_sl,
+            take_profit_price=_tp,
+            status=TradeStatus.open,
+            notes=f"Paper trade · {'UK stock' if is_uk_stock else 'commodity'} · conf {signal.confidence:.2f}",
+            opened_at=datetime.utcnow(),
+        )
+        db.add(trade)
+        await db.commit()
+        await db.refresh(trade)
+        await write_event(
+            "trade",
+            f"Opened {signal.action.upper()} {sym} @ {_price:.4f}",
+            severity="info",
+            body=f"Paper scalp · SL {_sl:.4f} · TP {_tp:.4f} · qty {_qty}",
+            symbol=sym,
+        )
         return {
             "action": signal.action,
-            "signal_confidence": signal.confidence,
-            "message": f"{sym} is a {'UK stock' if is_uk_stock else 'commodity'} — live orders require a CFD broker. Signal recorded.",
+            "trade_id": trade.id,
+            "entry_price": _price,
+            "stop_loss": _sl,
+            "take_profit": _tp,
+            "qty": _qty,
+            "message": f"Paper trade opened — {sym} {signal.action.upper()} @ {_price:.4f}",
             "indicators": signal.indicators,
         }
 
